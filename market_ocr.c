@@ -51,6 +51,11 @@ typedef struct {
     int base_client_h;
     POINT render_point;
     int render_point_set;
+    POINT macro_point_1;
+    int macro_point_1_set;
+    POINT macro_point_2;
+    int macro_point_2_set;
+    int macro_delay_ms;
     int overlay_enabled;
 } OCRConfig;
 
@@ -83,6 +88,10 @@ static int g_overlay_has_last = 0;
 static POINT g_overlay_text_point = {0, 0};
 static int g_overlay_has_point = 0;
 static char g_overlay_text[64] = "";
+static POINT g_overlay_macro_point_1 = {0, 0};
+static POINT g_overlay_macro_point_2 = {0, 0};
+static int g_overlay_has_macro_point_1 = 0;
+static int g_overlay_has_macro_point_2 = 0;
 
 static int clamp_int(int v, int lo, int hi) {
     if (v < lo) return lo;
@@ -266,13 +275,24 @@ static int select_target_window_by_click(void) {
                         g_config.price.region.y -= cr.top;
                         g_config.last_lot.region.x -= cr.left;
                         g_config.last_lot.region.y -= cr.top;
+                        if (g_config.render_point_set) {
+                            g_config.render_point.x -= cr.left;
+                            g_config.render_point.y -= cr.top;
+                        }
+                        if (g_config.macro_point_1_set) {
+                            g_config.macro_point_1.x -= cr.left;
+                            g_config.macro_point_1.y -= cr.top;
+                        }
+                        if (g_config.macro_point_2_set) {
+                            g_config.macro_point_2.x -= cr.left;
+                            g_config.macro_point_2.y -= cr.top;
+                        }
                     }
                 }
                 printf("Selected window: title='%s', class='%s'\n", g_config.window_title, g_config.window_class);
                 return 1;
             }
         }
-        Sleep(20);
     }
 }
 
@@ -653,7 +673,6 @@ static int select_region_from_screenshot(Region* out_region) {
             DispatchMessageA(&msg);
             if (st.done) break;
         }
-        Sleep(1);
     }
 
     DeleteObject(bmp);
@@ -675,6 +694,7 @@ typedef struct {
     int canceled;
     int has_point;
     POINT point;
+    char hint[160];
 } PointSelectorState;
 
 static LRESULT CALLBACK point_selector_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -707,7 +727,7 @@ static LRESULT CALLBACK point_selector_wnd_proc(HWND hwnd, UINT msg, WPARAM wPar
             HDC hdc = BeginPaint(hwnd, &ps);
             HDC mem = CreateCompatibleDC(hdc);
             HGDIOBJ oldbmp = SelectObject(mem, s->screenshot);
-            const char* hint = "Click to set render point. ESC = cancel";
+            const char* hint = s->hint[0] ? s->hint : "Click to set point. ESC = cancel";
             BitBlt(hdc, 0, 0, s->vw, s->vh, mem, 0, 0, SRCCOPY);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(255, 255, 255));
@@ -722,7 +742,7 @@ static LRESULT CALLBACK point_selector_wnd_proc(HWND hwnd, UINT msg, WPARAM wPar
     }
 }
 
-static int select_point_from_screenshot(POINT* out_point) {
+static int select_point_from_screenshot(POINT* out_point, const char* window_title, const char* hint_text) {
     HBITMAP bmp = NULL;
     WNDCLASSA wc;
     HWND hwnd;
@@ -757,11 +777,15 @@ static int select_point_from_screenshot(POINT* out_point) {
     st.vy = vy;
     st.vw = vw;
     st.vh = vh;
+    if (hint_text) {
+        strncpy(st.hint, hint_text, sizeof(st.hint) - 1);
+        st.hint[sizeof(st.hint) - 1] = '\0';
+    }
 
     hwnd = CreateWindowExA(
         WS_EX_TOPMOST,
         g_point_selector_class,
-        "Select Render Point",
+        window_title ? window_title : "Select Point",
         WS_POPUP | WS_VISIBLE,
         st.vx, st.vy, st.vw, st.vh,
         NULL, NULL, hinst, &st
@@ -785,7 +809,6 @@ static int select_point_from_screenshot(POINT* out_point) {
             DispatchMessageA(&msg);
             if (st.done) break;
         }
-        Sleep(1);
     }
 
     DeleteObject(bmp);
@@ -806,6 +829,16 @@ static RECT expand_rect_pixels(const Region* r, int pad) {
     return rc;
 }
 
+static void draw_overlay_point_square(HDC hdc, const POINT* pt, int half_size) {
+    Rectangle(
+        hdc,
+        pt->x - half_size,
+        pt->y - half_size,
+        pt->x + half_size + 1,
+        pt->y + half_size + 1
+    );
+}
+
 static LRESULT CALLBACK overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     (void)wParam;
     (void)lParam;
@@ -815,6 +848,9 @@ static LRESULT CALLBACK overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         HDC hdc = BeginPaint(hwnd, &ps);
         HPEN pen_price = CreatePen(PS_SOLID, 2, RGB(0, 220, 255));
         HPEN pen_last = CreatePen(PS_SOLID, 2, RGB(255, 160, 0));
+        HPEN pen_render = CreatePen(PS_SOLID, 2, RGB(255, 210, 120));
+        HPEN pen_macro_1 = CreatePen(PS_SOLID, 2, RGB(90, 235, 90));
+        HPEN pen_macro_2 = CreatePen(PS_SOLID, 2, RGB(255, 100, 100));
         HGDIOBJ old_pen = SelectObject(hdc, pen_price);
         HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
 
@@ -831,6 +867,18 @@ static LRESULT CALLBACK overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             SelectObject(hdc, pen_last);
             Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
         }
+        if (g_overlay_has_point) {
+            SelectObject(hdc, pen_render);
+            draw_overlay_point_square(hdc, &g_overlay_text_point, 5);
+        }
+        if (g_overlay_has_macro_point_1) {
+            SelectObject(hdc, pen_macro_1);
+            draw_overlay_point_square(hdc, &g_overlay_macro_point_1, 5);
+        }
+        if (g_overlay_has_macro_point_2) {
+            SelectObject(hdc, pen_macro_2);
+            draw_overlay_point_square(hdc, &g_overlay_macro_point_2, 5);
+        }
         if (g_overlay_has_point && g_overlay_text[0]) {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(255, 210, 120));
@@ -842,6 +890,9 @@ static LRESULT CALLBACK overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         SelectObject(hdc, old_pen);
         DeleteObject(pen_price);
         DeleteObject(pen_last);
+        DeleteObject(pen_render);
+        DeleteObject(pen_macro_1);
+        DeleteObject(pen_macro_2);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -907,7 +958,14 @@ static int overlay_ensure(void) {
     return 1;
 }
 
-static void overlay_update(const Region* price_r, const Region* last_r, const POINT* text_pt, const char* text) {
+static void overlay_update(
+    const Region* price_r,
+    const Region* last_r,
+    const POINT* text_pt,
+    const POINT* macro_pt_1,
+    const POINT* macro_pt_2,
+    const char* text
+) {
     if (!g_config.overlay_enabled) {
         overlay_hide();
         return;
@@ -919,6 +977,10 @@ static void overlay_update(const Region* price_r, const Region* last_r, const PO
     if (g_overlay_has_last) g_overlay_last = *last_r;
     g_overlay_has_point = (text_pt != NULL) ? 1 : 0;
     if (g_overlay_has_point) g_overlay_text_point = *text_pt;
+    g_overlay_has_macro_point_1 = (macro_pt_1 != NULL) ? 1 : 0;
+    g_overlay_has_macro_point_2 = (macro_pt_2 != NULL) ? 1 : 0;
+    if (g_overlay_has_macro_point_1) g_overlay_macro_point_1 = *macro_pt_1;
+    if (g_overlay_has_macro_point_2) g_overlay_macro_point_2 = *macro_pt_2;
     if (text) {
         strncpy(g_overlay_text, text, sizeof(g_overlay_text) - 1);
         g_overlay_text[sizeof(g_overlay_text) - 1] = '\0';
@@ -1175,6 +1237,103 @@ double last_lot_price(void) {
     return parse_price_text(txt);
 }
 
+static double round_price_2(double v) {
+    if (v < 0.0) return v;
+    return ((double)((int)(v * 100.0 + 0.5))) / 100.0;
+}
+
+static int send_unicode_text(const char* text) {
+    wchar_t wbuf[128];
+    int wlen;
+    INPUT inputs[256];
+    int count = 0;
+    int i;
+
+    if (!text || !text[0]) return 1;
+
+    wlen = MultiByteToWideChar(CP_ACP, 0, text, -1, wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
+    if (wlen <= 1) return 0;
+    if ((wlen - 1) * 2 > (int)(sizeof(inputs) / sizeof(inputs[0]))) return 0;
+
+    for (i = 0; i < wlen - 1; i++) {
+        ZeroMemory(&inputs[count], sizeof(INPUT));
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = 0;
+        inputs[count].ki.wScan = wbuf[i];
+        inputs[count].ki.dwFlags = KEYEVENTF_UNICODE;
+        count++;
+
+        ZeroMemory(&inputs[count], sizeof(INPUT));
+        inputs[count].type = INPUT_KEYBOARD;
+        inputs[count].ki.wVk = 0;
+        inputs[count].ki.wScan = wbuf[i];
+        inputs[count].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        count++;
+    }
+
+    return SendInput((UINT)count, inputs, sizeof(INPUT)) == (UINT)count;
+}
+
+static LONG normalize_mouse_coord(int value, int min_screen, int span_screen) {
+    if (span_screen <= 1) return 0;
+    return (LONG)(((double)(value - min_screen) * 65535.0) / (double)(span_screen - 1) + 0.5);
+}
+
+static int send_left_click_screen(const POINT* p) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    LONG mx;
+    LONG my;
+    INPUT in[3];
+
+    if (!p || vw <= 0 || vh <= 0) return 0;
+
+    mx = normalize_mouse_coord(p->x, vx, vw);
+    my = normalize_mouse_coord(p->y, vy, vh);
+
+    ZeroMemory(in, sizeof(in));
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in[0].mi.dx = mx;
+    in[0].mi.dy = my;
+
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+
+    in[2].type = INPUT_MOUSE;
+    in[2].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+    return SendInput(3, in, sizeof(INPUT)) == 3;
+}
+
+static int execute_macro_for_price(double price_value) {
+    POINT p1_abs;
+    POINT p2_abs;
+    char text[64];
+    double offer = round_price_2(price_value + 0.1);
+    HWND target;
+
+    if (!g_config.macro_point_1_set || !g_config.macro_point_2_set) return 0;
+    if (!get_effective_point(&g_config.macro_point_1, &p1_abs)) return 0;
+    if (!get_effective_point(&g_config.macro_point_2, &p2_abs)) return 0;
+
+    snprintf(text, sizeof(text), "%.2f", offer);
+    target = resolve_target_window();
+    if (target) SetForegroundWindow(target);
+
+    if (!send_unicode_text(text)) return 0;
+    Sleep(1);
+    if (!send_left_click_screen(&p1_abs)) return 0;
+
+    if (g_config.macro_delay_ms > 0) {
+        Sleep((DWORD)g_config.macro_delay_ms);
+    }
+
+    return send_left_click_screen(&p2_abs);
+}
+
 static int save_model(FILE* f, const char* name, const OCRModel* m) {
     int i, j;
     if (fprintf(f, "MODEL %s %d %d %d %d %d %d\n",
@@ -1236,6 +1395,51 @@ static int read_one_model_with_header_line(FILE* f, const char* header_line, OCR
     return read_model_body(f, m);
 }
 
+static int parse_optional_config_line(OCRConfig* cfg, const char* line) {
+    if (strncmp(line, "RENDER_POINT ", 13) == 0) {
+        int en = 0, x = 0, y = 0;
+        if (sscanf(line + 13, "%d %d %d", &en, &x, &y) == 3) {
+            cfg->render_point_set = en ? 1 : 0;
+            cfg->render_point.x = x;
+            cfg->render_point.y = y;
+        }
+        return 1;
+    }
+    if (strncmp(line, "MACRO_POINT1 ", 13) == 0) {
+        int en = 0, x = 0, y = 0;
+        if (sscanf(line + 13, "%d %d %d", &en, &x, &y) == 3) {
+            cfg->macro_point_1_set = en ? 1 : 0;
+            cfg->macro_point_1.x = x;
+            cfg->macro_point_1.y = y;
+        }
+        return 1;
+    }
+    if (strncmp(line, "MACRO_POINT2 ", 13) == 0) {
+        int en = 0, x = 0, y = 0;
+        if (sscanf(line + 13, "%d %d %d", &en, &x, &y) == 3) {
+            cfg->macro_point_2_set = en ? 1 : 0;
+            cfg->macro_point_2.x = x;
+            cfg->macro_point_2.y = y;
+        }
+        return 1;
+    }
+    if (strncmp(line, "MACRO_DELAY_MS ", 15) == 0) {
+        int v = 0;
+        if (sscanf(line + 15, "%d", &v) == 1) {
+            cfg->macro_delay_ms = clamp_int(v, 0, 600000);
+        }
+        return 1;
+    }
+    if (strncmp(line, "OVERLAY ", 8) == 0) {
+        int en = 1;
+        if (sscanf(line + 8, "%d", &en) == 1) {
+            cfg->overlay_enabled = en ? 1 : 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int save_config(const OCRConfig* cfg, const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
@@ -1259,7 +1463,19 @@ static int save_config(const OCRConfig* cfg, const char* path) {
         fclose(f);
         return 0;
     }
-    if (fprintf(f, "RENDER_POINT %d %d %d\n", cfg->render_point_set ? 1 : 0, cfg->render_point.x, cfg->render_point.y) < 0) {
+    if (fprintf(f, "RENDER_POINT %d %d %d\n", cfg->render_point_set ? 1 : 0, (int)cfg->render_point.x, (int)cfg->render_point.y) < 0) {
+        fclose(f);
+        return 0;
+    }
+    if (fprintf(f, "MACRO_POINT1 %d %d %d\n", cfg->macro_point_1_set ? 1 : 0, (int)cfg->macro_point_1.x, (int)cfg->macro_point_1.y) < 0) {
+        fclose(f);
+        return 0;
+    }
+    if (fprintf(f, "MACRO_POINT2 %d %d %d\n", cfg->macro_point_2_set ? 1 : 0, (int)cfg->macro_point_2.x, (int)cfg->macro_point_2.y) < 0) {
+        fclose(f);
+        return 0;
+    }
+    if (fprintf(f, "MACRO_DELAY_MS %d\n", cfg->macro_delay_ms) < 0) {
         fclose(f);
         return 0;
     }
@@ -1302,6 +1518,13 @@ static int load_config(OCRConfig* cfg, const char* path) {
     cfg->render_point_set = 0;
     cfg->render_point.x = 0;
     cfg->render_point.y = 0;
+    cfg->macro_point_1_set = 0;
+    cfg->macro_point_1.x = 0;
+    cfg->macro_point_1.y = 0;
+    cfg->macro_point_2_set = 0;
+    cfg->macro_point_2.x = 0;
+    cfg->macro_point_2.y = 0;
+    cfg->macro_delay_ms = 0;
     cfg->overlay_enabled = 1;
 
     if (!fgets(line, sizeof(line), f)) {
@@ -1349,18 +1572,7 @@ static int load_config(OCRConfig* cfg, const char* path) {
                 return 0;
             }
         }
-        while (strncmp(line, "RENDER_POINT ", 13) == 0 || strncmp(line, "OVERLAY ", 8) == 0) {
-            if (strncmp(line, "RENDER_POINT ", 13) == 0) {
-                int en = 0, x = 0, y = 0;
-                if (sscanf(line + 13, "%d %d %d", &en, &x, &y) == 3) {
-                    cfg->render_point_set = en ? 1 : 0;
-                    cfg->render_point.x = x;
-                    cfg->render_point.y = y;
-                }
-            } else if (strncmp(line, "OVERLAY ", 8) == 0) {
-                int en = 1;
-                if (sscanf(line + 8, "%d", &en) == 1) cfg->overlay_enabled = en ? 1 : 0;
-            }
+        while (parse_optional_config_line(cfg, line)) {
             if (!fgets(line, sizeof(line), f)) {
                 fclose(f);
                 return 0;
@@ -1371,18 +1583,7 @@ static int load_config(OCRConfig* cfg, const char* path) {
             return 0;
         }
     } else {
-        while (strncmp(line, "RENDER_POINT ", 13) == 0 || strncmp(line, "OVERLAY ", 8) == 0) {
-            if (strncmp(line, "RENDER_POINT ", 13) == 0) {
-                int en = 0, x = 0, y = 0;
-                if (sscanf(line + 13, "%d %d %d", &en, &x, &y) == 3) {
-                    cfg->render_point_set = en ? 1 : 0;
-                    cfg->render_point.x = x;
-                    cfg->render_point.y = y;
-                }
-            } else if (strncmp(line, "OVERLAY ", 8) == 0) {
-                int en = 1;
-                if (sscanf(line + 8, "%d", &en) == 1) cfg->overlay_enabled = en ? 1 : 0;
-            }
+        while (parse_optional_config_line(cfg, line)) {
             if (!fgets(line, sizeof(line), f)) {
                 fclose(f);
                 return 0;
@@ -1425,6 +1626,13 @@ static void init_defaults(OCRConfig* cfg) {
     cfg->render_point_set = 0;
     cfg->render_point.x = 0;
     cfg->render_point.y = 0;
+    cfg->macro_point_1_set = 0;
+    cfg->macro_point_1.x = 0;
+    cfg->macro_point_1.y = 0;
+    cfg->macro_point_2_set = 0;
+    cfg->macro_point_2.x = 0;
+    cfg->macro_point_2.y = 0;
+    cfg->macro_delay_ms = 0;
     cfg->overlay_enabled = 1;
     g_target_hwnd = NULL;
 }
@@ -1443,7 +1651,10 @@ static void print_status(const OCRConfig* cfg) {
     printf("price templates=%d threshold_bias=%d\n", cfg->price.template_count, cfg->price.threshold_bias);
     printf("last_lot region: x=%d y=%d w=%d h=%d\n", cfg->last_lot.region.x, cfg->last_lot.region.y, cfg->last_lot.region.w, cfg->last_lot.region.h);
     printf("last_lot templates=%d threshold_bias=%d\n", cfg->last_lot.template_count, cfg->last_lot.threshold_bias);
-    printf("render point: %s x=%d y=%d\n", cfg->render_point_set ? "SET" : "NOT SET", cfg->render_point.x, cfg->render_point.y);
+    printf("render point: %s x=%d y=%d\n", cfg->render_point_set ? "SET" : "NOT SET", (int)cfg->render_point.x, (int)cfg->render_point.y);
+    printf("macro point 1: %s x=%d y=%d\n", cfg->macro_point_1_set ? "SET" : "NOT SET", (int)cfg->macro_point_1.x, (int)cfg->macro_point_1.y);
+    printf("macro point 2: %s x=%d y=%d\n", cfg->macro_point_2_set ? "SET" : "NOT SET", (int)cfg->macro_point_2.x, (int)cfg->macro_point_2.y);
+    printf("macro delay ms=%d\n", cfg->macro_delay_ms);
     printf("overlay: %s\n", cfg->overlay_enabled ? "ON" : "OFF");
 }
 
@@ -1454,6 +1665,16 @@ static void set_threshold_bias(OCRModel* model, const char* name) {
     if (!fgets(line, sizeof(line), stdin)) return;
     if (sscanf(line, "%d", &v) == 1) {
         model->threshold_bias = clamp_int(v, -100, 100);
+    }
+}
+
+static void set_macro_delay_ms(void) {
+    char line[64];
+    int v;
+    printf("Current macro delay ms=%d. New value (0..600000): ", g_config.macro_delay_ms);
+    if (!fgets(line, sizeof(line), stdin)) return;
+    if (sscanf(line, "%d", &v) == 1) {
+        g_config.macro_delay_ms = clamp_int(v, 0, 600000);
     }
 }
 
@@ -1471,6 +1692,8 @@ static void test_once(void) {
 
 static void watch_loop(void) {
     ULONGLONG last_console_log = 0;
+    int has_prev_price = 0;
+    double prev_price = 0.0;
     MSG msg;
     HWND console_hwnd = GetConsoleWindow();
     printf("Watch started. Press ESC to stop.\n");
@@ -1482,21 +1705,49 @@ static void watch_loop(void) {
         Region* prp = NULL;
         Region* prl = NULL;
         POINT draw_pt;
+        POINT macro_pt_1;
+        POINT macro_pt_2;
         POINT* pdraw = NULL;
+        POINT* pmacro_1 = NULL;
+        POINT* pmacro_2 = NULL;
         char text[64];
         ULONGLONG now = GetTickCount64();
 
         if (get_effective_region(&g_config.price.region, &rp)) prp = &rp;
         if (get_effective_region(&g_config.last_lot.region, &rl)) prl = &rl;
         if (g_config.render_point_set && get_effective_point(&g_config.render_point, &draw_pt)) pdraw = &draw_pt;
+        if (g_config.macro_point_1_set && get_effective_point(&g_config.macro_point_1, &macro_pt_1)) pmacro_1 = &macro_pt_1;
+        if (g_config.macro_point_2_set && get_effective_point(&g_config.macro_point_2, &macro_pt_2)) pmacro_2 = &macro_pt_2;
 
-        if (lp >= 0.0) snprintf(text, sizeof(text), "%.2f", lp * 0.8);
+        if (lp >= 0.0) snprintf(text, sizeof(text), "%.2f", lp * 0.9);
         else strcpy(text, "ERR");
-        overlay_update(prp, prl, pdraw, text);
+        overlay_update(prp, prl, pdraw, pmacro_1, pmacro_2, text);
 
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+
+        if (p >= 0.0 && lp >= 0.0) {
+            double p_now = round_price_2(p);
+            double lp_now = round_price_2(lp);
+            if (has_prev_price && p_now > prev_price && p_now <= lp_now * 1) {
+                if (g_config.macro_point_1_set && g_config.macro_point_2_set) {
+                    int macro_ok = execute_macro_for_price(p_now);
+                    printf(
+                        "\nmacro %s: price=%.2f last=%.2f target=%.2f\n",
+                        macro_ok ? "executed" : "failed",
+                        p_now,
+                        lp_now,
+                        round_price_2(p_now + 0.1)
+                    );
+                }
+            }
+            prev_price = p_now;
+            has_prev_price = 1;
+        } else if (p >= 0.0) {
+            prev_price = round_price_2(p);
+            has_prev_price = 1;
         }
 
         if (!console_hwnd || !IsIconic(console_hwnd)) {
@@ -1509,7 +1760,6 @@ static void watch_loop(void) {
                 last_console_log = now;
             }
         }
-        Sleep(1);
     }
     overlay_hide();
     printf("\n");
@@ -1566,9 +1816,15 @@ static int select_model_region_with_window_support(Region* model_region, const c
     return 1;
 }
 
-static int select_render_point_with_window_support(void) {
+static int select_config_point_with_window_support(
+    POINT* out_model_point,
+    int* out_set_flag,
+    const char* point_name,
+    const char* selector_title,
+    const char* selector_hint
+) {
     POINT abs_point;
-    if (!select_point_from_screenshot(&abs_point)) return 0;
+    if (!select_point_from_screenshot(&abs_point, selector_title, selector_hint)) return 0;
 
     if (g_config.use_window) {
         RECT cr;
@@ -1584,13 +1840,51 @@ static int select_render_point_with_window_support(void) {
             g_config.base_client_w = cw;
             g_config.base_client_h = ch;
         }
-        g_config.render_point.x = (int)((abs_point.x - cr.left) * ((double)g_config.base_client_w / cw) + 0.5);
-        g_config.render_point.y = (int)((abs_point.y - cr.top) * ((double)g_config.base_client_h / ch) + 0.5);
+        out_model_point->x = (int)((abs_point.x - cr.left) * ((double)g_config.base_client_w / cw) + 0.5);
+        out_model_point->y = (int)((abs_point.y - cr.top) * ((double)g_config.base_client_h / ch) + 0.5);
     } else {
-        g_config.render_point = abs_point;
+        *out_model_point = abs_point;
     }
-    g_config.render_point_set = 1;
-    printf("Render point set: x=%d y=%d\n", g_config.render_point.x, g_config.render_point.y);
+    *out_set_flag = 1;
+    printf("%s set: x=%d y=%d\n", point_name, (int)out_model_point->x, (int)out_model_point->y);
+    return 1;
+}
+
+static int select_render_point_with_window_support(void) {
+    return select_config_point_with_window_support(
+        &g_config.render_point,
+        &g_config.render_point_set,
+        "Render point",
+        "Select Render Point",
+        "Click to set render point. ESC = cancel"
+    );
+}
+
+static int select_macro_point_1_with_window_support(void) {
+    return select_config_point_with_window_support(
+        &g_config.macro_point_1,
+        &g_config.macro_point_1_set,
+        "Macro point 1",
+        "Select Macro Point 1",
+        "Click to set first macro click point. ESC = cancel"
+    );
+}
+
+static int select_macro_point_2_with_window_support(void) {
+    return select_config_point_with_window_support(
+        &g_config.macro_point_2,
+        &g_config.macro_point_2_set,
+        "Macro point 2",
+        "Select Macro Point 2",
+        "Click to set delayed macro click point. ESC = cancel"
+    );
+}
+
+static int update_effective_point_if_set(POINT* model_pt, int is_set) {
+    POINT abs_pt;
+    if (!is_set) return 0;
+    if (!get_effective_point(model_pt, &abs_pt)) return 0;
+    *model_pt = abs_pt;
     return 1;
 }
 
@@ -1622,12 +1916,15 @@ int main(void) {
         printf("6 - Set price threshold bias\n");
         printf("7 - Set last_lot threshold bias\n");
         printf("8 - Select render point (screenshot click)\n");
-        printf("9 - Toggle overlay ON/OFF\n");
-        printf("10 - Test once\n");
-        printf("11 - Watch loop\n");
-        printf("12 - Save config\n");
-        printf("13 - Load config\n");
-        printf("14 - Status\n");
+        printf("9 - Select macro point 1 (click after typing)\n");
+        printf("10 - Select macro point 2 (delayed click)\n");
+        printf("11 - Set macro delay in ms\n");
+        printf("12 - Toggle overlay ON/OFF\n");
+        printf("13 - Test once\n");
+        printf("14 - Watch loop\n");
+        printf("15 - Save config\n");
+        printf("16 - Load config\n");
+        printf("17 - Status\n");
         printf("0 - Exit\n");
         printf("> ");
 
@@ -1640,16 +1937,15 @@ int main(void) {
             if (g_config.use_window) {
                 Region abs_price;
                 Region abs_last;
-                POINT abs_point;
                 if (get_effective_region(&g_config.price.region, &abs_price)) {
                     g_config.price.region = abs_price;
                 }
                 if (get_effective_region(&g_config.last_lot.region, &abs_last)) {
                     g_config.last_lot.region = abs_last;
                 }
-                if (g_config.render_point_set && get_effective_point(&g_config.render_point, &abs_point)) {
-                    g_config.render_point = abs_point;
-                }
+                update_effective_point_if_set(&g_config.render_point, g_config.render_point_set);
+                update_effective_point_if_set(&g_config.macro_point_1, g_config.macro_point_1_set);
+                update_effective_point_if_set(&g_config.macro_point_2, g_config.macro_point_2_set);
             }
             g_config.use_window = 0;
             g_config.base_client_w = 0;
@@ -1676,25 +1972,34 @@ int main(void) {
             select_render_point_with_window_support();
             break;
         case 9:
+            select_macro_point_1_with_window_support();
+            break;
+        case 10:
+            select_macro_point_2_with_window_support();
+            break;
+        case 11:
+            set_macro_delay_ms();
+            break;
+        case 12:
             g_config.overlay_enabled = g_config.overlay_enabled ? 0 : 1;
             printf("overlay: %s\n", g_config.overlay_enabled ? "ON" : "OFF");
             if (!g_config.overlay_enabled) overlay_hide();
             break;
-        case 10:
+        case 13:
             test_once();
             break;
-        case 11:
+        case 14:
             watch_loop();
             break;
-        case 12:
+        case 15:
             if (save_config(&g_config, CONFIG_FILE)) printf("Config saved.\n");
             else printf("Save failed.\n");
             break;
-        case 13:
+        case 16:
             if (load_config(&g_config, CONFIG_FILE)) printf("Config loaded.\n");
             else printf("Load failed.\n");
             break;
-        case 14:
+        case 17:
             print_status(&g_config);
             break;
         case 0:
