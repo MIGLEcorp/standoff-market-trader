@@ -14,6 +14,8 @@
 #define MAX_TEMPLATES 16
 #define MAX_SEGMENTS 64
 #define CONFIG_FILE "ocr_config.txt"
+#define USER_IDLE_REQUIRED_MS 1000
+#define MACRO_COOLDOWN_MS 3000
 
 typedef struct {
     int x;
@@ -1678,6 +1680,17 @@ static void set_macro_delay_ms(void) {
     }
 }
 
+static int is_user_idle_for_ms(DWORD required_idle_ms) {
+    LASTINPUTINFO lii;
+    DWORD now;
+
+    lii.cbSize = sizeof(lii);
+    if (!GetLastInputInfo(&lii)) return 1;
+
+    now = GetTickCount();
+    return (DWORD)(now - lii.dwTime) >= required_idle_ms;
+}
+
 static void test_once(void) {
     char a[128] = {0};
     char b[128] = {0};
@@ -1692,6 +1705,7 @@ static void test_once(void) {
 
 static void watch_loop(void) {
     ULONGLONG last_console_log = 0;
+    ULONGLONG macro_cooldown_until = 0;
     int has_prev_price = 0;
     double prev_price = 0.0;
     MSG msg;
@@ -1712,6 +1726,8 @@ static void watch_loop(void) {
         POINT* pmacro_2 = NULL;
         char text[64];
         ULONGLONG now = GetTickCount64();
+        int user_blocks_macro = !is_user_idle_for_ms(USER_IDLE_REQUIRED_MS);
+        int cooldown_blocks_macro = now < macro_cooldown_until;
 
         if (get_effective_region(&g_config.price.region, &rp)) prp = &rp;
         if (get_effective_region(&g_config.last_lot.region, &rl)) prl = &rl;
@@ -1719,7 +1735,7 @@ static void watch_loop(void) {
         if (g_config.macro_point_1_set && get_effective_point(&g_config.macro_point_1, &macro_pt_1)) pmacro_1 = &macro_pt_1;
         if (g_config.macro_point_2_set && get_effective_point(&g_config.macro_point_2, &macro_pt_2)) pmacro_2 = &macro_pt_2;
 
-        if (lp >= 0.0) snprintf(text, sizeof(text), "%.2f", lp * 0.9);
+        if (lp >= 0.0) snprintf(text, sizeof(text), "%.2f", lp * 0.8);
         else strcpy(text, "ERR");
         overlay_update(prp, prl, pdraw, pmacro_1, pmacro_2, text);
 
@@ -1733,14 +1749,17 @@ static void watch_loop(void) {
             double lp_now = round_price_2(lp);
             if (has_prev_price && p_now > prev_price && p_now <= lp_now * 1) {
                 if (g_config.macro_point_1_set && g_config.macro_point_2_set) {
-                    int macro_ok = execute_macro_for_price(p_now);
-                    printf(
-                        "\nmacro %s: price=%.2f last=%.2f target=%.2f\n",
-                        macro_ok ? "executed" : "failed",
-                        p_now,
-                        lp_now,
-                        round_price_2(p_now + 0.1)
-                    );
+                    if (!user_blocks_macro && !cooldown_blocks_macro) {
+                        int macro_ok = execute_macro_for_price(p_now);
+                        macro_cooldown_until = GetTickCount64() + MACRO_COOLDOWN_MS;
+                        printf(
+                            "\nmacro %s: price=%.2f last=%.2f target=%.2f\n",
+                            macro_ok ? "executed" : "failed",
+                            p_now,
+                            lp_now,
+                            round_price_2(p_now + 0.1)
+                        );
+                    }
                 }
             }
             prev_price = p_now;
